@@ -3,15 +3,14 @@ import requests
 from bs4 import BeautifulSoup
 import numpy as np
 import faiss
-from mistralai import Mistral
+from mistralai import Mistral, UserMessage
 import pickle
 import os
 
-# ----------------- Step 1: Load API Key Securely -----------------
+# -----------------  Loading API Key -----------------
 MISTRAL_API_KEY = st.secrets["MISTRAL_API_KEY"]  # API Key from Streamlit Secrets
-client = Mistral(api_key=MISTRAL_API_KEY)
 
-# ----------------- Step 2: Define URLs & Fetch Data -----------------
+# ----------------- Defining URLs -----------------
 policies = {
     "Transfer Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/transfer-policy",
     "Student Appeals Policy": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/student-appeals-policy",
@@ -25,77 +24,41 @@ policies = {
     "Library Study Room Booking": "https://www.udst.edu.qa/about-udst/institutional-excellence-ie/policies-and-procedures/library-study-room-booking-procedure",
 }
 
-# ----------------- Step 3: Web Scraping Function -----------------
-def scrape_text(url):
-    """Fetch and clean text from policy web pages."""
-    response = requests.get(url)
-    if response.status_code == 200:
-        soup = BeautifulSoup(response.text, "html.parser")
-        paragraphs = soup.find_all("p")
-        text = "\n".join([p.get_text() for p in paragraphs])
-        return text.strip()
-    return ""
+TEXT_FILE = "combined_policies.txt"
 
-# Fetch policy texts
-policy_texts = {name: scrape_text(url) for name, url in policies.items()}
+def load_and_chunk_text():
+    """Read saved combined text file and split into chunks."""
+    with open(TEXT_FILE, "r", encoding="utf-8") as f:
+        text = f.read()
+    chunk_size = 512
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    return chunks
 
-# ----------------- Step 4: Chunking Function -----------------
-def chunk_text(text, chunk_size=512):
-    """Break text into smaller chunks of specified size."""
-    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+all_chunks = load_and_chunk_text()
 
-chunked_data = {name: chunk_text(text) for name, text in policy_texts.items()}
+# Load FAISS index from .index file
+index = faiss.read_index("faiss_index.index")
 
-# Flatten chunks and track source policy
-all_chunks = []
-chunk_to_policy = {}
-for policy, chunks in chunked_data.items():
-    for chunk in chunks:
-        chunk_to_policy[len(all_chunks)] = policy
-        all_chunks.append(chunk)
+def get_text_embedding(list_txt_chunks):    
+    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])    
+    embeddings_batch_response = client.embeddings.create(model="mistral-embed",       
+                                                        inputs=list_txt_chunks) 
+    return embeddings_batch_response.data
 
-# ----------------- Step 5: Generate or Load Embeddings -----------------
-EMBEDDING_FILE = "embeddings_faiss.pkl"
-FAISS_INDEX_FILE = "faiss_index.idx"
+def mistral(user_message, model="mistral-small-latest", is_json=False):
+    model = "mistral-large-latest"
+    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+    messages = [
+        UserMessage(content=user_message),
+    ]
+    chat_response = client.chat.complete(
+        model=model,
+        messages=messages,
+    )
+    return chat_response.choices[0].message.content
 
-def get_text_embedding(text_list):
-    """Generate embeddings using Mistral API."""
-    response = client.embeddings.create(model="mistral-embed", inputs=text_list)
-    return np.array([entry.embedding for entry in response.data])
 
-def save_faiss_index(index, file_path):
-    """Save FAISS index to file."""
-    faiss.write_index(index, file_path)
-
-def load_faiss_index(file_path):
-    """Load FAISS index from file."""
-    if os.path.exists(file_path):
-        return faiss.read_index(file_path)
-    return None
-
-# Check if embeddings already exist
-if os.path.exists(EMBEDDING_FILE) and os.path.exists(FAISS_INDEX_FILE):
-    # Load embeddings & FAISS index
-    with open(EMBEDDING_FILE, "rb") as f:
-        text_embeddings = pickle.load(f)
-    index = load_faiss_index(FAISS_INDEX_FILE)
-else:
-    # Generate embeddings from scratch
-    text_embeddings = get_text_embedding(all_chunks)
-
-    # Save embeddings for future runs
-    with open(EMBEDDING_FILE, "wb") as f:
-        pickle.dump(text_embeddings, f)
-
-    # Create FAISS index
-    d = len(text_embeddings[0])
-    index = faiss.IndexFlatL2(d)
-    index.add(text_embeddings)
-
-    # Save FAISS index
-    save_faiss_index(index, FAISS_INDEX_FILE)
-
-# ----------------- Step 6: Streamlit UI -----------------
+# ----------------- Streamlit UI -----------------
 st.title("UDST Policy Query System")
 
 col1, col2 = st.columns([1, 2])
@@ -112,34 +75,25 @@ with col2:
     user_query = st.text_input("Enter your question:")
 
     if user_query:
-        # Generate query embedding
-        query_embedding = np.array([get_text_embedding([user_query])[0]])
+        query_embedding = np.array([get_text_embedding([user_query])[0].embedding])
 
-        # Retrieve similar chunks from FAISS
         D, I = index.search(query_embedding, k=3)
         retrieved_chunks = [all_chunks[i] for i in I[0]]
-        sources = [chunk_to_policy[i] for i in I[0]]
 
-        # Prepare prompt for Mistral AI
-        context = "\n\n".join(retrieved_chunks)
+        retrieved_chunk = [all_chunks[i] for i in I.tolist()[0]] 
         prompt = f"""
         Context information is below.
         ---------------------
-        {context}
+        {retrieved_chunk}
         ---------------------
         Given the context information and not prior knowledge, answer the query.
         Query: {user_query}
         Answer:
         """
 
-        response = client.chat.complete(model="mistral-large-latest", messages=[{"role": "user", "content": prompt}])
-        answer = response.choices[0].message.content
+        response = mistral(prompt)
+        answer = response
 
         # Display result
         st.header("Result of Query")
         st.write(answer)
-
-        # Display sources
-        st.subheader("Sources:")
-        for source in set(sources):
-            st.markdown(f"- **{source}**")
